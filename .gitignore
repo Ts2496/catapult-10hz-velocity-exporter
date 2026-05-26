@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets / environment files
+.streamlit/secrets.toml
+.env
+
+# Data exports - do not commit athlete data
+*.csv
+exports/
+data/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
