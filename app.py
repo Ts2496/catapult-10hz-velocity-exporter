@@ -1,8 +1,11 @@
 import csv
 import hmac
 import io
+import math
 import re
 import time
+import zipfile
+from collections import Counter
 from datetime import datetime, time as dt_time, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,8 +22,9 @@ import streamlit as st
 # - Paste Catapult API token at runtime
 # - Select date
 # - Select activity to help find the correct period
-# - Select period
-# - Export all athletes in the period with timestamp + raw velocity only
+# - Select one or more periods
+# - Export all athletes in the selected period(s) with elapsed time + raw velocity only
+# - Download a ZIP containing one CSV per athlete per selected period
 #
 # Security design:
 # - App is password protected using APP_PASSWORD stored in Streamlit Secrets
@@ -38,6 +42,9 @@ REGION_BASE_URLS = {
 }
 
 RAW_VELOCITY_PARAMETERS = "ts,cs,rv"
+PAGE_SIZE_SECONDS = 300  # Internal API chunk size. User still receives one combined CSV.
+FALLBACK_MAX_PAGES_PER_ATHLETE = 100  # Used only if Catapult does not return usable period timestamps.
+LONG_EXPORT_WARNING_SECONDS = 30 * 60
 DEFAULT_TIMEOUT_SECONDS = 45
 
 
@@ -99,11 +106,25 @@ def check_app_password() -> bool:
 # -----------------------------
 # Utility functions
 # -----------------------------
+def normalise_api_token(api_token: str) -> str:
+    """Clean token input without storing or logging it.
+
+    Users sometimes paste either the raw token or the full header value
+    beginning with "Bearer ". The API header must contain exactly one
+    Bearer prefix.
+    """
+    token = (api_token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
+
+
 def make_headers(api_token: str) -> Dict[str, str]:
+    token = normalise_api_token(api_token)
     return {
-        "Authorization": f"Bearer {api_token}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/json",
-        "User-Agent": "Catapult10HzVelocityExporter/1.0",
+        "User-Agent": "Catapult10HzVelocityExporter/1.2",
     }
 
 
@@ -145,9 +166,14 @@ def request_json(
     )
 
     if response.status_code == 401:
-        raise requests.HTTPError("401 unauthenticated: check the Catapult API token.")
+        raise requests.HTTPError(
+            "401 unauthenticated. Check: token copied correctly, token has not expired, "
+            "correct region selected, and token has access to Connect metadata endpoints such as /periods."
+        )
     if response.status_code == 403:
-        raise requests.HTTPError("403 forbidden: token may not have access to this data.")
+        raise requests.HTTPError(
+            "403 forbidden. The token is valid but may not have permission for this endpoint/data."
+        )
     if response.status_code == 404:
         raise requests.HTTPError(f"404 not found: endpoint or ID not found: {endpoint}")
     if response.status_code == 422:
@@ -279,31 +305,19 @@ def get_period_sensor_page(
 # Data processing
 # -----------------------------
 def activity_display_name(activity: Dict[str, Any]) -> str:
+    """Return the clean activity name for the dropdown and export metadata."""
     activity_id = str(safe_get(activity, ["id", "activity_id"], "unknown"))
-    name = safe_get(activity, ["name", "activity_name", "title"], None)
-    start = parse_epoch(safe_get(activity, ["start_time", "start", "start_timestamp"], None))
-
-    date_text = "unknown date"
-    if start:
-        date_text = datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y-%m-%d")
+    name = str(safe_get(activity, ["name", "activity_name", "title"], "")).strip()
 
     if name:
-        return f"{name} | {date_text} | {short_id(activity_id)}"
-    return f"Activity {short_id(activity_id)} | {date_text}"
+        return name
+    return f"Activity {short_id(activity_id)}"
 
 
 def period_display_name(period: Dict[str, Any]) -> str:
-    period_id = str(period.get("id", "unknown"))
-    name = str(period.get("name", "Unnamed period"))
-    start = parse_epoch(period.get("start_time"))
-    end = parse_epoch(period.get("end_time"))
-
-    if start and end:
-        start_text = datetime.fromtimestamp(start, tz=timezone.utc).strftime("%H:%M:%S")
-        end_text = datetime.fromtimestamp(end, tz=timezone.utc).strftime("%H:%M:%S")
-        return f"{name} | {start_text}–{end_text} | {short_id(period_id)}"
-
-    return f"{name} | {short_id(period_id)}"
+    """Return the clean period name for the dropdown and export metadata."""
+    name = str(period.get("name", "")).strip()
+    return name or "Unnamed period"
 
 
 def build_activity_options(
@@ -344,15 +358,27 @@ def build_activity_options(
                 "start_time": period.get("start_time"),
             }
 
-    options = {}
+    activity_items = []
     for activity_id, activity in activity_map.items():
-        period_count = sum(1 for p in periods_for_date if str(p.get("activity_id")) == activity_id)
-        label = f"{activity_display_name(activity)} | {period_count} period(s)"
-        options[label] = {
-            "activity_id": activity_id,
-            "activity": activity,
-            "periods": [p for p in periods_for_date if str(p.get("activity_id")) == activity_id],
-        }
+        activity_items.append(
+            {
+                "activity_id": activity_id,
+                "activity": activity,
+                "display_name": activity_display_name(activity),
+                "periods": [p for p in periods_for_date if str(p.get("activity_id")) == activity_id],
+            }
+        )
+
+    # Show only the activity name in normal use. If two activities on the same
+    # day have the exact same name, append a short ID only to prevent ambiguity.
+    name_counts = Counter(item["display_name"] for item in activity_items)
+
+    options = {}
+    for item in activity_items:
+        label = item["display_name"]
+        if name_counts[label] > 1:
+            label = f"{label} ({short_id(item['activity_id'])})"
+        options[label] = item
 
     return dict(sorted(options.items(), key=lambda x: x[0].lower()))
 
@@ -385,6 +411,8 @@ def flatten_sensor_payload(
     athlete: Dict[str, Any],
     period: Dict[str, Any],
     activity_label: str,
+    period_export_label: str,
+    period_order: int,
 ) -> List[Dict[str, Any]]:
     rows = []
 
@@ -431,6 +459,8 @@ def flatten_sensor_payload(
                     "activity_name": activity_label,
                     "activity_id": activity_id,
                     "period_name": period_name,
+                    "period_export_label": period_export_label,
+                    "period_order": period_order,
                     "period_id": period_id,
                     "stream_type": stream_type,
                     "device_id": device_id,
@@ -445,6 +475,28 @@ def flatten_sensor_payload(
     return rows
 
 
+def estimate_pages_for_period(
+    start_time: Optional[int],
+    end_time: Optional[int],
+    page_size_seconds: int = PAGE_SIZE_SECONDS,
+) -> Tuple[int, Optional[int]]:
+    """Return number of API pages needed for the selected period.
+
+    If period timestamps are available, the app exports the full period by
+    calculating how many 300-second API chunks are needed. If timestamps are
+    missing, it uses a fallback empty-page stopping strategy.
+    """
+    if start_time is None or end_time is None:
+        return FALLBACK_MAX_PAGES_PER_ATHLETE, None
+
+    duration_seconds = max(0, int(math.ceil(float(end_time) - float(start_time))))
+    if duration_seconds == 0:
+        return 1, duration_seconds
+
+    pages = max(1, int(math.ceil(duration_seconds / page_size_seconds)))
+    return pages, duration_seconds
+
+
 def fetch_all_velocity_for_athlete(
     base_url: str,
     api_token: str,
@@ -453,12 +505,11 @@ def fetch_all_velocity_for_athlete(
     stream_type: Optional[str],
     start_time: Optional[int],
     end_time: Optional[int],
-    page_size_seconds: int,
-    max_pages: int,
 ) -> List[Dict[str, Any]]:
     all_blocks: List[Dict[str, Any]] = []
+    pages_to_fetch, duration_seconds = estimate_pages_for_period(start_time, end_time)
 
-    for page in range(1, max_pages + 1):
+    for page in range(1, pages_to_fetch + 1):
         blocks = get_period_sensor_page(
             base_url=base_url,
             api_token=api_token,
@@ -468,7 +519,7 @@ def fetch_all_velocity_for_athlete(
             start_time=start_time,
             end_time=end_time,
             page=page,
-            page_size_seconds=page_size_seconds,
+            page_size_seconds=PAGE_SIZE_SECONDS,
             nulls=True,
         )
 
@@ -478,22 +529,118 @@ def fetch_all_velocity_for_athlete(
             break
 
         all_blocks.extend(blocks)
-
-        # Expected number of rows is roughly 10Hz * seconds.
-        # If a page returns clearly fewer rows than expected, it is probably the last page.
-        expected_rows = page_size_seconds * 10
-        if rows_on_page < expected_rows * 0.5:
-            break
-
         time.sleep(0.05)  # small pause to reduce request pressure
 
     return all_blocks
+
+
+def build_r_ready_velocity_export(export_df: pd.DataFrame) -> pd.DataFrame:
+    """Return the minimal CSV format needed for the R analysis.
+
+    Catapult provides time as ts + cs. We keep ts/cs internally to preserve
+    10Hz timing precision, then export a simple elapsed time variable so the
+    R script can calculate time differences directly.
+    """
+    required = ["athlete_name", "timestamp_s", "raw_velocity_mps"]
+    missing = [col for col in required if col not in export_df.columns]
+    if missing:
+        raise ValueError(f"Missing required export column(s): {missing}")
+
+    minimal = export_df.copy()
+    minimal = minimal.sort_values("timestamp_s")
+
+    first_timestamp = pd.to_numeric(minimal["timestamp_s"], errors="coerce").min()
+    minimal["time_s"] = pd.to_numeric(minimal["timestamp_s"], errors="coerce") - first_timestamp
+    minimal["time_s"] = minimal["time_s"].round(3)
+
+    return minimal[["athlete_name", "time_s", "raw_velocity_mps"]]
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     buffer = io.StringIO()
     df.to_csv(buffer, index=False, quoting=csv.QUOTE_MINIMAL)
     return buffer.getvalue().encode("utf-8")
+
+
+def dataframes_to_player_period_zip_bytes(df: pd.DataFrame, file_stub: str) -> bytes:
+    """Create one CSV per athlete per selected period inside one ZIP file.
+
+    The ZIP uses flat, readable filenames so the downloaded folder can be
+    dropped straight into an R workflow. A manifest CSV is also included so the
+    export can be checked quickly.
+    """
+    zip_buffer = io.BytesIO()
+    manifest_rows: List[Dict[str, Any]] = []
+
+    sort_cols = [
+        col
+        for col in ["period_order", "period_export_label", "athlete_name", "timestamp_s"]
+        if col in df.columns
+    ]
+
+    if sort_cols:
+        df = df.sort_values(sort_cols)
+
+    group_cols = [
+        "period_order",
+        "period_export_label",
+        "period_name",
+        "period_id",
+        "athlete_name",
+        "athlete_id",
+    ]
+
+    group_cols = [col for col in group_cols if col in df.columns]
+
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        grouped = df.groupby(group_cols, dropna=False, sort=True)
+
+        for group_key, export_df in grouped:
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+
+            group_values = dict(zip(group_cols, group_key))
+            period_order = int(group_values.get("period_order", 0) or 0)
+            period_label = str(group_values.get("period_export_label", "period") or "period")
+            period_name = str(group_values.get("period_name", "period") or "period")
+            period_id = str(group_values.get("period_id", "") or "")
+            athlete_name = str(group_values.get("athlete_name", "unknown_athlete") or "unknown_athlete")
+            athlete_id = str(group_values.get("athlete_id", "") or "")
+
+            safe_period = clean_filename(period_label)
+            safe_athlete = clean_filename(athlete_name)
+            safe_athlete_id = clean_filename(short_id(athlete_id, length=8))
+
+            csv_name = f"{period_order:02d}_{safe_period}__{safe_athlete}__velocity_data.csv"
+
+            if not safe_athlete or safe_athlete == "unknown_athlete":
+                csv_name = f"{period_order:02d}_{safe_period}__athlete_{safe_athlete_id}__velocity_data.csv"
+
+            export_df = export_df.sort_values("timestamp_s") if "timestamp_s" in export_df.columns else export_df
+            r_ready_df = build_r_ready_velocity_export(export_df)
+            zf.writestr(csv_name, dataframe_to_csv_bytes(r_ready_df))
+
+            manifest_rows.append(
+                {
+                    "file_name": csv_name,
+                    "athlete_name": athlete_name,
+                    "athlete_id": athlete_id,
+                    "period_order": period_order,
+                    "period_export_label": period_label,
+                    "period_name": period_name,
+                    "period_id": period_id,
+                    "rows": len(r_ready_df),
+                    "first_time_s": r_ready_df["time_s"].min() if "time_s" in r_ready_df else None,
+                    "last_time_s": r_ready_df["time_s"].max() if "time_s" in r_ready_df else None,
+                }
+            )
+
+        if manifest_rows:
+            manifest_df = pd.DataFrame(manifest_rows).sort_values(["period_order", "athlete_name"])
+            zf.writestr("export_manifest.csv", dataframe_to_csv_bytes(manifest_df))
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
 
 
 # -----------------------------
@@ -503,7 +650,7 @@ if not check_app_password():
     st.stop()
 
 st.title("Catapult OpenField 10Hz Raw Velocity Exporter")
-st.caption("Period-level export only: athlete name, timestamp, and raw velocity for R analysis.")
+st.caption("Period-level export only: athlete name, elapsed time, and raw velocity for R analysis.")
 
 with st.sidebar:
     st.header("Settings")
@@ -524,27 +671,9 @@ with st.sidebar:
 
     selected_date = st.date_input("Session date")
 
-    stream_type = st.selectbox(
-        "Stream type",
-        options=["Default from OpenField", "GPS", "LPS"],
-        index=0,
-    )
-
-    page_size_seconds = st.selectbox(
-        "Page size seconds",
-        options=[30, 60, 120, 300],
-        index=1,
-        help="Smaller values are safer. 60 seconds returns about 600 rows per athlete per page.",
-    )
-
-    max_pages = st.number_input(
-        "Maximum pages per athlete",
-        min_value=1,
-        max_value=500,
-        value=100,
-        step=1,
-        help="Safety limit to avoid accidental huge requests.",
-    )
+    # Stream type is intentionally not exposed in the UI.
+    # If omitted, Catapult returns the stream type assigned to the period/activity in OpenField.
+    stream_type = None
 
     if st.button("Log out of app"):
         for key in list(st.session_state.keys()):
@@ -552,8 +681,9 @@ with st.sidebar:
         st.rerun()
 
 st.info(
-    "This app does not export full activities. It uses the selected activity only to find the correct period, "
-    "then extracts raw 10Hz velocity from that period for all athletes in the period."
+    "This app does not export full activities. It uses the selected activity only to find the correct testing period(s), "
+    "then exports the full selected period(s) for all athletes using internal 300-second API chunks. "
+    "The main output is a ZIP containing one R-ready CSV per athlete per selected period."
 )
 
 if not api_token:
@@ -565,7 +695,7 @@ start_unix, end_unix = unix_range_for_date(selected_date)
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    load_clicked = st.button("1. Load activities and periods", type="primary")
+    load_clicked = st.button("Load activities and periods", type="primary")
 
 with col2:
     st.write(
@@ -609,7 +739,7 @@ if not activity_options:
     st.stop()
 
 selected_activity_label = st.selectbox(
-    "2. Select activity",
+    "Select activity",
     options=list(activity_options.keys()),
 )
 
@@ -620,98 +750,165 @@ if not activity_periods:
     st.error("No periods found for this activity.")
     st.stop()
 
-period_options = {period_display_name(period): period for period in activity_periods}
+# Show only the period name in normal use. If duplicate period names exist
+# within the selected activity, label them as Name 1, Name 2, etc. This is useful
+# for repeated testing bouts such as two separate "Deceleration" periods.
+period_base_labels = [period_display_name(period) for period in activity_periods]
+name_seen: Dict[str, int] = {}
+period_options: Dict[str, Dict[str, Any]] = {}
+period_export_labels: Dict[str, str] = {}
+period_orders: Dict[str, int] = {}
 
-selected_period_label = st.selectbox(
-    "3. Select period",
+for period_index, (period, base_label) in enumerate(zip(activity_periods, period_base_labels), start=1):
+    name_seen[base_label] = name_seen.get(base_label, 0) + 1
+    duplicate_number = name_seen[base_label]
+
+    # Label for the dropdown. If you have two periods both called
+    # "Deceleration", the app shows "Deceleration 1" and "Deceleration 2".
+    label = base_label
+    if period_base_labels.count(base_label) > 1:
+        label = f"{base_label} {duplicate_number}"
+
+    period_id_for_label = str(period.get("id", f"period_{period_index}"))
+    period_options[label] = period
+    period_export_labels[period_id_for_label] = label
+    period_orders[period_id_for_label] = period_index
+
+selected_period_labels = st.multiselect(
+    "Select period(s)",
     options=list(period_options.keys()),
+    help="Select one or more testing bouts. Example: Deceleration 1 and Deceleration 2.",
 )
 
-selected_period = period_options[selected_period_label]
-selected_period_id = str(selected_period.get("id"))
-period_start = parse_epoch(selected_period.get("start_time"))
-period_end = parse_epoch(selected_period.get("end_time"))
+if not selected_period_labels:
+    st.warning("Select at least one period to export.")
+    st.stop()
 
-with st.expander("Selected period details"):
-    st.json(
-        {
-            "activity": selected_activity_label,
-            "period": selected_period.get("name"),
-            "period_id": selected_period_id,
-            "activity_id": selected_period.get("activity_id"),
-            "period_start_unix": period_start,
-            "period_end_unix": period_end,
-            "parameters_to_export": RAW_VELOCITY_PARAMETERS,
-        }
+selected_periods = [period_options[label] for label in selected_period_labels]
+
+if len(selected_periods) > 1:
+    st.caption(
+        f"Selected {len(selected_periods)} periods. The ZIP will contain one CSV per athlete per selected period."
     )
 
-extract_clicked = st.button("4. Extract raw 10Hz velocity CSV", type="primary")
+long_periods = []
+missing_time_periods = []
+for period in selected_periods:
+    period_start = parse_epoch(period.get("start_time"))
+    period_end = parse_epoch(period.get("end_time"))
+    _, duration_seconds = estimate_pages_for_period(period_start, period_end)
+    if duration_seconds is None:
+        missing_time_periods.append(period_display_name(period))
+    elif duration_seconds > LONG_EXPORT_WARNING_SECONDS:
+        long_periods.append((period_display_name(period), duration_seconds))
+
+if long_periods:
+    st.warning(
+        "One or more selected periods is longer than 30 minutes. The app will still try to export the full period(s), "
+        "but this may take longer because every athlete is exported in internal API chunks."
+    )
+
+if missing_time_periods:
+    st.warning(
+        "One or more selected periods does not have usable start/end timestamps. The app will use a fallback paging "
+        "strategy and stop when Catapult returns no more data."
+    )
+
+extract_clicked = st.button("Extract raw 10Hz velocity CSVs", type="primary")
 
 if extract_clicked:
-    if not selected_period_id:
-        st.error("Selected period has no period ID.")
+    all_rows: List[Dict[str, Any]] = []
+    failed_requests: List[str] = []
+    export_jobs: List[Dict[str, Any]] = []
+
+    with st.spinner("Loading athletes for selected period(s)..."):
+        for period in selected_periods:
+            period_id = str(period.get("id", ""))
+            if not period_id:
+                failed_requests.append(f"{period_display_name(period)}: selected period has no period ID.")
+                continue
+
+            try:
+                athletes = get_athletes_in_period(base_url, api_token, period_id)
+            except Exception as exc:
+                failed_requests.append(f"{period_display_name(period)}: could not load athletes: {exc}")
+                continue
+
+            if not athletes:
+                failed_requests.append(f"{period_display_name(period)}: no athletes found.")
+                continue
+
+            for athlete in athletes:
+                export_jobs.append({"period": period, "athlete": athlete})
+
+    if not export_jobs:
+        st.error("No export jobs were created. Check that the selected period(s) have athletes.")
+        if failed_requests:
+            with st.expander("Failed setup requests"):
+                for item in failed_requests:
+                    st.write(item)
         st.stop()
 
-    with st.spinner("Loading athletes in selected period..."):
-        try:
-            athletes = get_athletes_in_period(base_url, api_token, selected_period_id)
-        except Exception as exc:
-            st.error("Could not load athletes in the selected period.")
-            st.exception(exc)
-            st.stop()
-
-    if not athletes:
-        st.error("No athletes found in this period.")
-        st.stop()
-
-    st.write(f"Found **{len(athletes)} athlete(s)** in this period.")
+    st.write(
+        f"Preparing **{len(export_jobs)} file export(s)** from "
+        f"**{len(selected_periods)} selected period(s)**."
+    )
 
     progress = st.progress(0)
     status = st.empty()
-    all_rows: List[Dict[str, Any]] = []
-    failed_athletes: List[str] = []
 
-    for idx, athlete in enumerate(athletes, start=1):
+    for idx, job in enumerate(export_jobs, start=1):
+        period = job["period"]
+        athlete = job["athlete"]
+
+        period_id = str(period.get("id", ""))
+        period_start = parse_epoch(period.get("start_time"))
+        period_end = parse_epoch(period.get("end_time"))
+        period_export_label = period_export_labels.get(period_id, period_display_name(period))
+        period_order = period_orders.get(period_id, idx)
+
         athlete_id = str(safe_get(athlete, ["id", "athlete_id"], ""))
         first = str(safe_get(athlete, ["first_name", "athlete_first_name"], "")).strip()
         last = str(safe_get(athlete, ["last_name", "athlete_last_name"], "")).strip()
         athlete_name = " ".join([first, last]).strip() or athlete_id
 
-        status.write(f"Extracting {idx}/{len(athletes)}: {athlete_name}")
+        status.write(
+            f"Extracting {idx}/{len(export_jobs)}: {period_export_label} — {athlete_name}"
+        )
 
         try:
             sensor_blocks = fetch_all_velocity_for_athlete(
                 base_url=base_url,
                 api_token=api_token,
-                period_id=selected_period_id,
+                period_id=period_id,
                 athlete_id=athlete_id,
                 stream_type=stream_type,
                 start_time=period_start,
                 end_time=period_end,
-                page_size_seconds=int(page_size_seconds),
-                max_pages=int(max_pages),
             )
 
             athlete_rows = flatten_sensor_payload(
                 sensor_blocks=sensor_blocks,
                 athlete=athlete,
-                period=selected_period,
+                period=period,
                 activity_label=selected_activity_label,
+                period_export_label=period_export_label,
+                period_order=period_order,
             )
             all_rows.extend(athlete_rows)
         except Exception as exc:
-            failed_athletes.append(f"{athlete_name} ({athlete_id}): {exc}")
+            failed_requests.append(f"{period_export_label} — {athlete_name} ({athlete_id}): {exc}")
 
-        progress.progress(idx / len(athletes))
+        progress.progress(idx / len(export_jobs))
         time.sleep(0.05)
 
     status.write("Extraction complete.")
 
     if not all_rows:
-        st.error("No raw velocity rows were returned. Check that the period is full-synced and has sensor data.")
-        if failed_athletes:
-            with st.expander("Failed athlete requests"):
-                for item in failed_athletes:
+        st.error("No raw velocity rows were returned. Check that the selected period(s) are full-synced and have sensor data.")
+        if failed_requests:
+            with st.expander("Failed requests"):
+                for item in failed_requests:
                     st.write(item)
         st.stop()
 
@@ -724,6 +921,8 @@ if extract_clicked:
         "activity_name",
         "activity_id",
         "period_name",
+        "period_export_label",
+        "period_order",
         "period_id",
         "stream_type",
         "device_id",
@@ -735,40 +934,62 @@ if extract_clicked:
     ]
     df = df[[col for col in ordered_columns if col in df.columns]]
 
-    st.success(f"Export ready: {len(df):,} rows across {df['athlete_name'].nunique()} athlete(s).")
+    n_periods_returned = df["period_id"].nunique() if "period_id" in df.columns else len(selected_periods)
+    n_athletes_returned = df["athlete_name"].nunique() if "athlete_name" in df.columns else 0
 
-    if failed_athletes:
-        st.warning(f"{len(failed_athletes)} athlete request(s) failed. CSV was still created for successful athletes.")
-        with st.expander("Failed athlete requests"):
-            for item in failed_athletes:
+    st.success(
+        f"Export ready: {len(df):,} rows across {n_athletes_returned} athlete(s) and {n_periods_returned} period(s)."
+    )
+
+    if failed_requests:
+        st.warning(f"{len(failed_requests)} request(s) failed. CSVs were still created for successful requests.")
+        with st.expander("Failed requests"):
+            for item in failed_requests:
                 st.write(item)
 
-    st.subheader("Preview")
-    st.dataframe(df.head(200), use_container_width=True)
+    if len(selected_periods) == 1:
+        period_stub = selected_periods[0].get("name", "period")
+    else:
+        period_stub = "multi_period"
 
     file_stub = clean_filename(
-        f"catapult_10hz_velocity_{selected_date}_{selected_period.get('name', 'period')}"
+        f"catapult_10hz_velocity_{selected_date}_{period_stub}"
     )
-    csv_bytes = dataframe_to_csv_bytes(df)
+    zip_bytes = dataframes_to_player_period_zip_bytes(df, file_stub=file_stub)
 
     st.download_button(
-        label="Download CSV",
-        data=csv_bytes,
-        file_name=f"{file_stub}.csv",
-        mime="text/csv",
+        label="Download R-ready player-period CSVs (.zip)",
+        data=zip_bytes,
+        file_name=f"{file_stub}_player_period_files.zip",
+        mime="application/zip",
+        type="primary",
     )
+
+    player_summary = (
+        df.groupby(["period_order", "period_export_label", "period_name", "athlete_name", "athlete_id"], dropna=False)
+        .agg(
+            rows=("raw_velocity_mps", "size"),
+            first_timestamp_s=("timestamp_s", "min"),
+            last_timestamp_s=("timestamp_s", "max"),
+        )
+        .reset_index()
+        .sort_values(["period_order", "athlete_name"])
+    )
+
+    st.subheader("Export format")
+    st.write("Each player-period CSV inside the ZIP contains only these columns:")
+    st.code("athlete_name,time_s,raw_velocity_mps", language="text")
+
+    with st.expander("Player-period file summary"):
+        st.dataframe(player_summary, use_container_width=True)
 
     with st.expander("Column definitions"):
         st.markdown(
             """
 - `athlete_name`: athlete first and last name from Catapult
-- `athlete_id`: Catapult athlete ID used internally for the API request
-- `activity_name`: selected activity label used to locate the period
-- `period_name`: selected period name
-- `timestamp_unix_s`: Catapult timestamp in seconds
-- `centiseconds`: Catapult centisecond field
-- `timestamp_s`: combined timestamp as `ts + cs / 100`
-- `datetime_utc`: UTC timestamp converted from `timestamp_s`
+- `time_s`: elapsed time in seconds from the first sample in that player-period file
 - `raw_velocity_mps`: Catapult `rv` field, raw velocity in metres per second
+
+The app still uses Catapult `ts` and `cs` internally to preserve 10Hz timing precision, but it does not export those fields into the individual player CSVs.
             """
         )
